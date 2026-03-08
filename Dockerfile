@@ -1,4 +1,3 @@
-# ── Stage 1: Build ───────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -6,20 +5,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 COPY . .
 
-# Zero external dependencies — pure stdlib + POSIX sockets
 RUN g++ -std=c++17 -O2 \
     -I. -Imodels -Iservices -Iutils -Iapi \
     api/server.cpp \
     models/Card.cpp \
     services/TarotDeck.cpp \
+    utils/TarotCombinations.cpp \
     -o tarot_api \
-    -lpthread \
-    && echo "=== Build successful ==="
+    -lpthread
 
-# ── Stage 2: Run ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runner
 
 WORKDIR /app
