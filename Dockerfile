@@ -24,8 +24,7 @@ RUN g++ -std=c++17 -O2 \
     services/TarotDeck.cpp \
     -o tarot_api \
     -lpthread \
-    -lssl -lcrypto \
-    && echo "=== Build successful ==="
+    -lssl -lcrypto
 
 FROM debian:bookworm-slim AS runner
 
