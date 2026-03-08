@@ -1,16 +1,22 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  Tarot Card Reader — Crow REST API
-//  Endpoints:
-//    GET  /health             → liveness check for Render
-//    GET  /api/cards          → list all 10 cards
-//    GET  /api/moods          → list all 5 moods
-//    POST /api/reading        → perform a reading
-//    GET  /api/history        → full session history (in-memory)
+//  Tarot Card Reader — Minimal HTTP REST API
+//  Uses only POSIX sockets + C++ stdlib — zero external dependencies
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "crow_all.h"
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <cstring>
+#include <cstdlib>
 
-// Pull in all tarot logic (paths relative to project root)
+// POSIX socket headers
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+// Tarot engine
 #include "../models/User.h"
 #include "../models/TarotCard.h"
 #include "../models/Card.h"
@@ -18,240 +24,240 @@
 #include "../services/TarotEngine.h"
 #include "../utils/TarotCombinations.h"
 
-#include <string>
-#include <vector>
-#include <mutex>
+// ── Global state ──────────────────────────────────────────────────────────────
+static TarotEngine g_engine;
+static std::mutex  g_mutex;
 
-// ── Global state (one engine per process, mutex-protected) ────────────────────
-static TarotEngine  g_engine;
-static std::mutex   g_mutex;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// Card index (1-10) -> display name
 static const char* CARD_NAMES[11] = {
     "", "The Fool", "The Magician", "The High Priestess",
     "The Empress", "The Emperor", "The Lovers",
     "The Chariot", "Strength", "The Hermit", "The Star"
 };
 
-// Mood string -> User::Mood enum
+// ── JSON helpers ──────────────────────────────────────────────────────────────
+static std::string jsonStr(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"')  out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out + "\"";
+}
+
+// ── Simple JSON parser — extract string/int values ────────────────────────────
+static std::string parseJsonString(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return "";
+    pos = json.find('"', pos);
+    if (pos == std::string::npos) return "";
+    size_t end = json.find('"', pos + 1);
+    if (end == std::string::npos) return "";
+    return json.substr(pos + 1, end - pos - 1);
+}
+
+static int parseJsonInt(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return -1;
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return -1;
+    pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    return std::atoi(json.c_str() + pos);
+}
+
+// ── Mood parser ───────────────────────────────────────────────────────────────
 static User::Mood parseMood(const std::string& s) {
-    if (s == "Happy"   || s == "happy")   return User::Mood::Happy;
-    if (s == "Sad"     || s == "sad")     return User::Mood::Sad;
-    if (s == "Neutral" || s == "neutral") return User::Mood::Neutral;
-    if (s == "Confused"|| s == "confused")return User::Mood::Confused;
-    if (s == "Excited" || s == "excited") return User::Mood::Excited;
+    if (s == "Happy"   || s == "happy")    return User::Mood::Happy;
+    if (s == "Sad"     || s == "sad")      return User::Mood::Sad;
+    if (s == "Neutral" || s == "neutral")  return User::Mood::Neutral;
+    if (s == "Confused"|| s == "confused") return User::Mood::Confused;
+    if (s == "Excited" || s == "excited")  return User::Mood::Excited;
     return User::Mood::Neutral;
 }
 
-// Validate card index
-static bool validCard(int i) { return i >= 1 && i <= 10; }
+// ── HTTP response builder ─────────────────────────────────────────────────────
+static std::string httpResponse(int code, const std::string& body) {
+    std::string status = (code == 200) ? "200 OK" :
+                         (code == 400) ? "400 Bad Request" : "500 Internal Server Error";
+    std::ostringstream res;
+    res << "HTTP/1.1 " << status << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Access-Control-Allow-Origin: *\r\n"
+        << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        << "Access-Control-Allow-Headers: Content-Type\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Connection: close\r\n"
+        << "\r\n"
+        << body;
+    return res.str();
+}
 
-// Add CORS headers to every response
-static void addCors(crow::response& res) {
-    res.add_header("Access-Control-Allow-Origin",  "*");
-    res.add_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.add_header("Access-Control-Allow-Headers", "Content-Type");
+// ── Route handlers ────────────────────────────────────────────────────────────
+static std::string handleHealth() {
+    return R"({"status":"ok","service":"Tarot Card Reader API"})";
+}
+
+static std::string handleCards() {
+    std::ostringstream j;
+    j << "{\"cards\":[";
+    for (int i = 1; i <= 10; ++i) {
+        if (i > 1) j << ",";
+        j << "{\"id\":" << i << ",\"name\":" << jsonStr(CARD_NAMES[i]) << "}";
+    }
+    j << "]}";
+    return j.str();
+}
+
+static std::string handleMoods() {
+    return R"({"moods":[
+        {"id":1,"name":"Happy"},
+        {"id":2,"name":"Sad"},
+        {"id":3,"name":"Neutral"},
+        {"id":4,"name":"Confused"},
+        {"id":5,"name":"Excited"}
+    ]})";
+}
+
+static std::string handleReading(const std::string& body) {
+    std::string name = parseJsonString(body, "name");
+    if (name.empty()) name = "Seeker";
+
+    std::string moodStr = parseJsonString(body, "mood");
+    User::Mood mood = parseMood(moodStr);
+
+    int pastIdx    = parseJsonInt(body, "past");
+    int presentIdx = parseJsonInt(body, "present");
+    int futureIdx  = parseJsonInt(body, "future");
+
+    // Validate
+    if (pastIdx < 1 || pastIdx > 10 || presentIdx < 1 || presentIdx > 10 || futureIdx < 1 || futureIdx > 10)
+        return "";  // signal 400
+    if (pastIdx == presentIdx || pastIdx == futureIdx || presentIdx == futureIdx)
+        return "";
+
+    User user;
+    user.setName(name);
+    user.setMood(mood);
+
+    std::string past_t, present_t, future_t, synergy_t, suggestion_t;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        past_t       = g_engine.getPastMeaning(pastIdx, presentIdx, futureIdx);
+        present_t    = g_engine.getPresentMeaning(pastIdx, presentIdx, futureIdx);
+        future_t     = g_engine.getFutureMeaning(pastIdx, presentIdx, futureIdx);
+        synergy_t    = g_engine.getSynergy(pastIdx, presentIdx, futureIdx);
+        suggestion_t = g_engine.getSuggestion(pastIdx, presentIdx, futureIdx);
+    }
+
+    synergy_t = applyMoodTone(synergy_t, mood);
+
+    std::ostringstream j;
+    j << "{"
+      << "\"name\":"    << jsonStr(name) << ","
+      << "\"mood\":"    << jsonStr(user.getMoodString()) << ","
+      << "\"cards\":{"
+      <<   "\"past\":"    << "{\"id\":" << pastIdx    << ",\"name\":" << jsonStr(CARD_NAMES[pastIdx])    << "},"
+      <<   "\"present\":" << "{\"id\":" << presentIdx << ",\"name\":" << jsonStr(CARD_NAMES[presentIdx]) << "},"
+      <<   "\"future\":"  << "{\"id\":" << futureIdx  << ",\"name\":" << jsonStr(CARD_NAMES[futureIdx])  << "}"
+      << "},"
+      << "\"reading\":{"
+      <<   "\"past\":"       << jsonStr(past_t)       << ","
+      <<   "\"present\":"    << jsonStr(present_t)    << ","
+      <<   "\"future\":"     << jsonStr(future_t)     << ","
+      <<   "\"synergy\":"    << jsonStr(synergy_t)    << ","
+      <<   "\"suggestion\":" << jsonStr(suggestion_t)
+      << "}"
+      << "}";
+    return j.str();
+}
+
+// ── Request dispatcher ────────────────────────────────────────────────────────
+static void handleClient(int clientSock) {
+    char buf[8192] = {};
+    int bytes = recv(clientSock, buf, sizeof(buf) - 1, 0);
+    if (bytes <= 0) { close(clientSock); return; }
+
+    std::string req(buf, bytes);
+
+    // Parse method and path
+    std::istringstream reqStream(req);
+    std::string method, path, version;
+    reqStream >> method >> path >> version;
+
+    // Strip query string
+    size_t qpos = path.find('?');
+    if (qpos != std::string::npos) path = path.substr(0, qpos);
+
+    // Extract body (after \r\n\r\n)
+    std::string body;
+    size_t bodyPos = req.find("\r\n\r\n");
+    if (bodyPos != std::string::npos) body = req.substr(bodyPos + 4);
+
+    std::string respBody;
+    int code = 200;
+
+    if (method == "OPTIONS") {
+        respBody = "{}";
+    } else if (path == "/health") {
+        respBody = handleHealth();
+    } else if (path == "/api/cards" && method == "GET") {
+        respBody = handleCards();
+    } else if (path == "/api/moods" && method == "GET") {
+        respBody = handleMoods();
+    } else if (path == "/api/reading" && method == "POST") {
+        respBody = handleReading(body);
+        if (respBody.empty()) {
+            code = 400;
+            respBody = R"({"error":"Invalid card indices (1-10, no duplicates) or missing fields"})";
+        }
+    } else {
+        code = 400;
+        respBody = R"({"error":"Route not found"})";
+    }
+
+    std::string response = httpResponse(code, respBody);
+    send(clientSock, response.c_str(), response.size(), 0);
+    close(clientSock);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 int main() {
-    crow::SimpleApp app;
-
-    // ── OPTIONS preflight (CORS) ─────────────────────────────────────────────
-    CROW_ROUTE(app, "/api/<path>").methods(crow::HTTPMethod::OPTIONS)
-    ([](const crow::request&, crow::response& res, std::string) {
-        addCors(res);
-        res.code = 204;
-        res.end();
-    });
-
-    // ── GET /health ──────────────────────────────────────────────────────────
-    CROW_ROUTE(app, "/health")
-    ([](crow::response& res) {
-        addCors(res);
-        res.set_header("Content-Type", "application/json");
-        res.write(R"({"status":"ok","service":"Tarot Card Reader API"})");
-        res.end();
-    });
-
-    // ── GET /api/cards ───────────────────────────────────────────────────────
-    CROW_ROUTE(app, "/api/cards")
-    ([](crow::response& res) {
-        addCors(res);
-        res.set_header("Content-Type", "application/json");
-
-        crow::json::wvalue data;
-        for (int i = 1; i <= 10; ++i) {
-            data["cards"][i-1]["id"]   = i;
-            data["cards"][i-1]["name"] = CARD_NAMES[i];
-        }
-        res.write(data.dump());
-        res.end();
-    });
-
-    // ── GET /api/moods ───────────────────────────────────────────────────────
-    CROW_ROUTE(app, "/api/moods")
-    ([](crow::response& res) {
-        addCors(res);
-        res.set_header("Content-Type", "application/json");
-
-        crow::json::wvalue data;
-        std::vector<std::string> moods = {"Happy","Sad","Neutral","Confused","Excited"};
-        for (int i = 0; i < (int)moods.size(); ++i) {
-            data["moods"][i]["id"]   = i + 1;
-            data["moods"][i]["name"] = moods[i];
-        }
-        res.write(data.dump());
-        res.end();
-    });
-
-    // ── POST /api/reading ────────────────────────────────────────────────────
-    //  Request JSON:
-    //  {
-    //    "name":    "Suhani",
-    //    "mood":    "Happy",          // or 1-5
-    //    "past":    1,                // card index 1-10
-    //    "present": 3,
-    //    "future":  7
-    //  }
-    //
-    //  Response JSON:
-    //  {
-    //    "name":    "Suhani",
-    //    "mood":    "Happy",
-    //    "cards": {
-    //      "past":    { "id": 1, "name": "The Fool"    },
-    //      "present": { "id": 3, "name": "The High Priestess" },
-    //      "future":  { "id": 7, "name": "The Chariot" }
-    //    },
-    //    "reading": {
-    //      "past":       "...",
-    //      "present":    "...",
-    //      "future":     "...",
-    //      "synergy":    "...",
-    //      "suggestion": "..."
-    //    }
-    //  }
-    CROW_ROUTE(app, "/api/reading").methods(crow::HTTPMethod::POST)
-    ([](const crow::request& req, crow::response& res) {
-        addCors(res);
-        res.set_header("Content-Type", "application/json");
-
-        // ── Parse body ───────────────────────────────────────────────────────
-        auto body = crow::json::load(req.body);
-        if (!body) {
-            res.code = 400;
-            res.write(R"({"error":"Invalid JSON body"})");
-            res.end();
-            return;
-        }
-
-        // name
-        std::string name = "Seeker";
-        if (body.has("name") && body["name"].t() == crow::json::type::String)
-            name = body["name"].s();
-
-        // mood — accept string or int
-        User::Mood mood = User::Mood::Neutral;
-        if (body.has("mood")) {
-            auto& m = body["mood"];
-            if (m.t() == crow::json::type::String)
-                mood = parseMood(std::string(m.s()));
-            else if (m.t() == crow::json::type::Number)
-                mood = static_cast<User::Mood>((int)m.i());
-        }
-
-        // card indices
-        if (!body.has("past") || !body.has("present") || !body.has("future")) {
-            res.code = 400;
-            res.write(R"({"error":"Missing fields: past, present, future (card indices 1-10)"})");
-            res.end();
-            return;
-        }
-
-        int pastIdx    = (int)body["past"].i();
-        int presentIdx = (int)body["present"].i();
-        int futureIdx  = (int)body["future"].i();
-
-        // Validate
-        if (!validCard(pastIdx) || !validCard(presentIdx) || !validCard(futureIdx)) {
-            res.code = 400;
-            res.write(R"({"error":"Card indices must be between 1 and 10"})");
-            res.end();
-            return;
-        }
-        if (pastIdx == presentIdx || pastIdx == futureIdx || presentIdx == futureIdx) {
-            res.code = 400;
-            res.write(R"({"error":"Each card must be unique — no duplicates allowed"})");
-            res.end();
-            return;
-        }
-
-        // ── Perform reading (thread-safe) ────────────────────────────────────
-        User user;
-        user.setName(name);
-        user.setMood(mood);
-
-        std::string past_text, present_text, future_text, synergy_text, suggestion_text;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            past_text       = g_engine.getPastMeaning(pastIdx, presentIdx, futureIdx);
-            present_text    = g_engine.getPresentMeaning(pastIdx, presentIdx, futureIdx);
-            future_text     = g_engine.getFutureMeaning(pastIdx, presentIdx, futureIdx);
-            synergy_text    = g_engine.getSynergy(pastIdx, presentIdx, futureIdx);
-            suggestion_text = g_engine.getSuggestion(pastIdx, presentIdx, futureIdx);
-        }
-
-        // Apply mood tone to synergy
-        synergy_text = applyMoodTone(synergy_text, mood);
-
-        // ── Build response ───────────────────────────────────────────────────
-        crow::json::wvalue resp;
-        resp["name"] = name;
-        resp["mood"] = user.getMoodString();
-
-        resp["cards"]["past"]["id"]      = pastIdx;
-        resp["cards"]["past"]["name"]    = CARD_NAMES[pastIdx];
-        resp["cards"]["present"]["id"]   = presentIdx;
-        resp["cards"]["present"]["name"] = CARD_NAMES[presentIdx];
-        resp["cards"]["future"]["id"]    = futureIdx;
-        resp["cards"]["future"]["name"]  = CARD_NAMES[futureIdx];
-
-        resp["reading"]["past"]       = past_text;
-        resp["reading"]["present"]    = present_text;
-        resp["reading"]["future"]     = future_text;
-        resp["reading"]["synergy"]    = synergy_text;
-        resp["reading"]["suggestion"] = suggestion_text;
-
-        res.write(resp.dump());
-        res.end();
-    });
-
-    // ── GET /api/history ─────────────────────────────────────────────────────
-    CROW_ROUTE(app, "/api/history")
-    ([](crow::response& res) {
-        addCors(res);
-        res.set_header("Content-Type", "application/json");
-
-        // History is in TarotEngine — expose reading count for now
-        // Full history would need a getter added to TarotEngine
-        std::lock_guard<std::mutex> lock(g_mutex);
-        crow::json::wvalue data;
-        data["readings_this_session"] = g_engine.readingCount();
-        data["note"] = "Full history persisted in data/history.txt on the server";
-        res.write(data.dump());
-        res.end();
-    });
-
-    // ── Start server ─────────────────────────────────────────────────────────
-    // Render injects PORT env variable — default to 8080 for local dev
     const char* port_env = std::getenv("PORT");
-    uint16_t port = port_env ? (uint16_t)std::stoi(port_env) : 8080;
+    int port = port_env ? std::atoi(port_env) : 8080;
 
-    std::cout << "Tarot API starting on port " << port << std::endl;
-    app.port(port).multithreaded().run();
+    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSock < 0) { std::cerr << "socket() failed\n"; return 1; }
+
+    int opt = 1;
+    setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(serverSock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "bind() failed\n"; return 1;
+    }
+    listen(serverSock, 128);
+
+    std::cout << "Tarot API running on port " << port << std::endl;
+
+    while (true) {
+        sockaddr_in clientAddr{};
+        socklen_t clientLen = sizeof(clientAddr);
+        int clientSock = accept(serverSock, (sockaddr*)&clientAddr, &clientLen);
+        if (clientSock < 0) continue;
+        // Handle each request in its own thread
+        std::thread([clientSock]() { handleClient(clientSock); }).detach();
+    }
 
     return 0;
 }
