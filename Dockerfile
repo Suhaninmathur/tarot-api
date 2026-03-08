@@ -1,36 +1,41 @@
-FROM debian:bookworm-slim AS builder
+FROM alpine:3.19 AS builder
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
+RUN apk add --no-cache \
+    g++ \
+    make \
     wget \
-    libssl-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    openssl-dev \
+    boost-dev \
+    linux-headers
 
 WORKDIR /app
 
+# Download Crow single header
 RUN wget -q \
     "https://github.com/CrowCpp/Crow/releases/download/v1.0%2B5/crow_all.h" \
     -O /usr/local/include/crow_all.h
 
 COPY . .
 
+# Compile with verbose output so we can see any errors
 RUN g++ -std=c++17 -O2 \
     -I. -Imodels -Iservices -Iutils -Iapi \
     -I/usr/local/include \
-    -DCROW_USE_BOOST=0 \
     api/server.cpp \
     models/Card.cpp \
     services/TarotDeck.cpp \
     -o tarot_api \
     -lpthread \
-    -lssl -lcrypto
+    -lssl -lcrypto \
+    -lboost_system \
+    && echo "BUILD OK"
 
-FROM debian:bookworm-slim AS runner
+FROM alpine:3.19 AS runner
 
-RUN apt-get update && apt-get install -y \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    libstdc++ \
+    openssl \
+    boost
 
 WORKDIR /app
 COPY --from=builder /app/tarot_api ./tarot_api
