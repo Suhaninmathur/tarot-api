@@ -3,7 +3,6 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y \
     build-essential \
     wget \
-    libboost-all-dev \
     libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -11,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 RUN wget -q \
-    https://github.com/CrowCpp/Crow/releases/download/v1.0%2B5/crow_all.h \
+    "https://github.com/CrowCpp/Crow/releases/download/v1.0%2B5/crow_all.h" \
     -O /usr/local/include/crow_all.h
 
 COPY . .
@@ -19,17 +18,18 @@ COPY . .
 RUN g++ -std=c++17 -O2 \
     -I. -Imodels -Iservices -Iutils -Iapi \
     -I/usr/local/include \
+    -DCROW_USE_BOOST=0 \
     api/server.cpp \
     models/Card.cpp \
     services/TarotDeck.cpp \
     -o tarot_api \
     -lpthread \
-    -lboost_system
+    -lssl -lcrypto \
+    && echo "=== Build successful ==="
 
 FROM debian:bookworm-slim AS runner
 
 RUN apt-get update && apt-get install -y \
-    libboost-system1.81.0 \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
