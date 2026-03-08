@@ -1,0 +1,28 @@
+# Build outputs
+build/
+*.exe
+*.o
+*.a
+tarot_api
+tarot
+
+# Data / history files (don't commit user data)
+data/history.txt
+
+# IDE files
+.vscode/
+.idea/
+*.suo
+*.user
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
